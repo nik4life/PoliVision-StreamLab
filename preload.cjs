@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('streamLab', {
   start: (config) => ipcRenderer.invoke('streamlab:start', config),
   stop: () => ipcRenderer.invoke('streamlab:stop'),
   getStatus: () => ipcRenderer.invoke('streamlab:get-status'),
+  getEncoder: () => ipcRenderer.invoke('streamlab:get-encoder'),
   onStatus: (callback) => {
     const handler = (_event, status) => callback(status);
     ipcRenderer.on('streamlab:status', handler);
