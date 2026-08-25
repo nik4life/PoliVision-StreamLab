@@ -7,11 +7,15 @@ let mainWindow;
 const processes = new Map();
 let detectedEncoder = null;
 let startGeneration = 0;
+let requestedCount = 0;
+const MULTICAST_URL = 'udp://239.255.42.42:23000';
 
 function ffmpegPath() {
   if (!ffmpegStatic) throw new Error('FFmpeg binary was not found.');
   return ffmpegStatic.replace('app.asar', 'app.asar.unpacked');
 }
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 function runProbe(args) {
   return new Promise((resolve) => {
@@ -45,9 +49,7 @@ function streamUrl(config, index) {
   return `rtsp://${auth}${host}:${port}/streamlab/cam${suffix}`;
 }
 
-function publicStreamUrl(config, index) {
-  return streamUrl(config, index).replace(/\/\/.*@/, '//');
-}
+function publicStreamUrl(config, index) { return streamUrl(config, index).replace(/\/\/.*@/, '//'); }
 
 function stopAll() {
   startGeneration += 1;
@@ -56,44 +58,33 @@ function stopAll() {
     try { entry.child.kill('SIGTERM'); } catch (_) {}
   }
   processes.clear();
+  requestedCount = 0;
   sendStatus();
 }
 
 function statusSnapshot(extra = {}) {
-  const entry = processes.get(1);
-  const count = Number(entry?.count || 0);
-  const running = entry?.state === 'active' ? count : 0;
-  const starting = entry?.state === 'starting' ? count : 0;
+  const publishers = [...processes.entries()].filter(([key]) => String(key).startsWith('pub-'));
+  const running = publishers.filter(([, entry]) => entry.state === 'active').length;
+  const starting = publishers.filter(([, entry]) => entry.state === 'starting').length;
   return {
     running,
     starting,
-    streams: running ? Array.from({ length: count }, (_, i) => i + 1) : [],
+    streams: publishers.filter(([, entry]) => entry.state === 'active').map(([, entry]) => entry.index).sort((a, b) => a - b),
     encoder: detectedEncoder,
-    architecture: 'single-process-tee',
+    architecture: 'single-encode-local-multicast-fanout',
+    requested: requestedCount,
     ...extra,
   };
 }
 
-function sendStatus(extra = {}) {
-  mainWindow?.webContents.send('streamlab:status', statusSnapshot(extra));
-}
+function sendStatus(extra = {}) { mainWindow?.webContents.send('streamlab:status', statusSnapshot(extra)); }
 
-function encodeArgs(encoder) {
-  return ['-c:v', encoder.codec, ...encoder.args, '-pix_fmt', 'yuv420p'];
-}
+function encodeArgs(encoder) { return ['-c:v', encoder.codec, ...encoder.args, '-pix_fmt', 'yuv420p']; }
 
-function teeTarget(config, index) {
-  // One encoded packet stream is duplicated directly to every MediaMTX path.
-  // onfail=ignore prevents one failed RTSP destination from terminating all others.
-  return `[onfail=ignore:f=rtsp:rtsp_transport=tcp]${streamUrl(config, index)}`;
-}
+function producerOutputUrl() { return `${MULTICAST_URL}?pkt_size=1316&ttl=1`; }
+function publisherInputUrl() { return `${MULTICAST_URL}?reuse=1&fifo_size=1000000&overrun_nonfatal=1`; }
 
-function outputArgs(config, count) {
-  const tee = Array.from({ length: count }, (_, i) => teeTarget(config, i + 1)).join('|');
-  return ['-map', '0:v:0', '-f', 'tee', tee];
-}
-
-function syntheticArgs(config, encoder, count) {
+function syntheticProducerArgs(config, encoder) {
   const width = Number(config.width);
   const height = Number(config.height);
   const fps = Number(config.fps);
@@ -101,45 +92,55 @@ function syntheticArgs(config, encoder, count) {
     '-hide_banner', '-loglevel', 'warning', '-re',
     '-f', 'lavfi', '-i', `testsrc2=size=${width}x${height}:rate=${fps}`,
     '-an', ...encodeArgs(encoder),
-    '-g', String(Math.max(fps * 2, 30)), '-keyint_min', String(Math.max(fps * 2, 30)), '-sc_threshold', '0',
-    ...outputArgs(config, count),
+    '-g', String(Math.max(fps, 25)), '-keyint_min', String(Math.max(fps, 25)), '-sc_threshold', '0',
+    '-f', 'mpegts', '-muxdelay', '0', '-muxpreload', '0', producerOutputUrl(),
   ];
 }
 
-function fileArgs(config, encoder, count) {
+function fileProducerArgs(config, encoder) {
   const fps = Number(config.fps);
   return [
     '-hide_banner', '-loglevel', 'warning', '-re', '-stream_loop', '-1', '-i', config.filePath,
     '-an', '-vf', `scale=${Number(config.width)}:${Number(config.height)}:force_original_aspect_ratio=decrease,pad=${Number(config.width)}:${Number(config.height)}:(ow-iw)/2:(oh-ih)/2,fps=${fps}`,
-    ...encodeArgs(encoder), '-g', String(Math.max(fps * 2, 30)),
-    ...outputArgs(config, count),
+    ...encodeArgs(encoder), '-g', String(Math.max(fps, 25)), '-keyint_min', String(Math.max(fps, 25)), '-sc_threshold', '0',
+    '-f', 'mpegts', '-muxdelay', '0', '-muxpreload', '0', producerOutputUrl(),
   ];
 }
 
-function registerProcess(child, count, failures, encoder) {
-  const entry = { child, count, state: 'starting', verifyTimer: null };
-  processes.set(1, entry);
+function publisherArgs(config, index) {
+  return [
+    '-hide_banner', '-loglevel', 'warning',
+    '-fflags', 'nobuffer', '-flags', 'low_delay', '-probesize', '32768', '-analyzeduration', '100000',
+    '-i', publisherInputUrl(),
+    '-map', '0:v:0', '-an', '-c:v', 'copy',
+    '-f', 'rtsp', '-rtsp_transport', 'tcp', streamUrl(config, index),
+  ];
+}
+
+function registerProcess(key, child, failures, encoder, options = {}) {
+  const entry = { child, state: 'starting', verifyTimer: null, index: options.index || 0, kind: options.kind || 'publisher' };
+  processes.set(key, entry);
   let stderr = '';
   child.stderr.on('data', (chunk) => {
     stderr += chunk.toString();
-    if (stderr.length > 12000) stderr = stderr.slice(-12000);
+    if (stderr.length > 10000) stderr = stderr.slice(-10000);
   });
   entry.verifyTimer = setTimeout(() => {
-    if (processes.get(1) === entry && entry.child.exitCode === null) {
+    if (processes.get(key) === entry && entry.child.exitCode === null) {
       entry.state = 'active';
       sendStatus({ failures, encoder });
     }
-  }, 3500);
+  }, entry.kind === 'producer' ? 1200 : 2200);
   child.once('exit', (code, signal) => {
     clearTimeout(entry.verifyTimer);
-    if (processes.get(1) === entry) processes.delete(1);
-    if (code && code !== 0) failures.push({ index: 0, code, signal, message: stderr.trim().slice(-3000) });
+    if (processes.get(key) === entry) processes.delete(key);
+    if (code && code !== 0) failures.push({ index: entry.index || 0, code, signal, message: stderr.trim().slice(-1800) });
     sendStatus({ failures, encoder });
   });
   child.once('error', (error) => {
     clearTimeout(entry.verifyTimer);
-    if (processes.get(1) === entry) processes.delete(1);
-    failures.push({ index: 0, message: error.message });
+    if (processes.get(key) === entry) processes.delete(key);
+    failures.push({ index: entry.index || 0, message: error.message });
     sendStatus({ failures, encoder });
   });
   return entry;
@@ -149,27 +150,33 @@ async function startStreams(config) {
   stopAll();
   const generation = ++startGeneration;
   const count = Math.max(1, Math.min(64, Number(config.count || 1)));
+  requestedCount = count;
   const failures = [];
   const encoder = await detectEncoder();
   if (generation !== startGeneration) return { ok: false, requested: count, encoder, urls: [] };
-
   sendStatus({ failures, encoder });
 
-  // Encode once and duplicate the already encoded H.264 packets inside the same
-  // FFmpeg process to all RTSP destinations. This removes the previous
-  // MediaMTX -> StreamLab -> MediaMTX mirror round-trips, which could saturate a
-  // 1-Gbit network with 32 x 4K streams and cause RTP sequence/decode errors.
-  const args = config.sourceMode === 'file'
-    ? fileArgs(config, encoder, count)
-    : syntheticArgs(config, encoder, count);
-  const child = spawn(ffmpegPath(), args, { windowsHide: true });
-  registerProcess(child, count, failures, encoder);
+  // Every publisher waits on one local multicast H.264 feed and only remuxes it
+  // to its own RTSP path. This keeps exactly one hardware encoder session, but
+  // unlike the old RTSP tee, one slow RTSP destination cannot throttle all others.
+  for (let index = 1; index <= count; index += 1) {
+    if (generation !== startGeneration) break;
+    const child = spawn(ffmpegPath(), publisherArgs(config, index), { windowsHide: true });
+    registerProcess(`pub-${index}`, child, failures, encoder, { index, kind: 'publisher' });
+    if (index % 4 === 0) await sleep(80);
+  }
+
+  await sleep(300);
+  if (generation !== startGeneration) return { ok: false, requested: count, encoder, urls: [] };
+  const producerArgs = config.sourceMode === 'file' ? fileProducerArgs(config, encoder) : syntheticProducerArgs(config, encoder);
+  const producer = spawn(ffmpegPath(), producerArgs, { windowsHide: true });
+  registerProcess('producer', producer, failures, encoder, { kind: 'producer' });
 
   return {
     ok: true,
     requested: count,
     encoder,
-    architecture: 'single-process-tee',
+    architecture: 'single-encode-local-multicast-fanout',
     urls: Array.from({ length: count }, (_, i) => publicStreamUrl(config, i + 1)),
   };
 }
