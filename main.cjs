@@ -1,6 +1,7 @@
 const { app, BrowserWindow, dialog, ipcMain } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
+const { PassThrough } = require('stream');
 const ffmpegStatic = require('ffmpeg-static');
 
 let mainWindow;
@@ -54,6 +55,7 @@ function stopAll() {
   startGeneration += 1;
   for (const entry of processes.values()) {
     clearTimeout(entry.verifyTimer);
+    try { entry.fanout?.end(); } catch (_) {}
     try { entry.child.stdin?.end(); } catch (_) {}
     try { entry.child.kill('SIGTERM'); } catch (_) {}
   }
@@ -71,8 +73,9 @@ function statusSnapshot(extra = {}) {
     starting,
     streams: publishers.filter(([, entry]) => entry.state === 'active').map(([, entry]) => entry.index).sort((a, b) => a - b),
     encoder: detectedEncoder,
-    architecture: 'single-encode-local-pipe-fanout',
+    architecture: 'single-encode-buffered-local-fanout',
     requested: requestedCount,
+    maxBufferedBytes: Math.max(0, ...publishers.map(([, entry]) => Number(entry.fanout?.writableLength || 0))),
     ...extra,
   };
 }
@@ -107,8 +110,8 @@ function fileProducerArgs(config, encoder) {
 function publisherArgs(config, index) {
   return [
     '-hide_banner', '-loglevel', 'warning',
-    '-fflags', '+genpts+nobuffer', '-flags', 'low_delay',
-    '-f', 'mpegts', '-probesize', '32768', '-analyzeduration', '100000', '-i', 'pipe:0',
+    '-fflags', '+genpts',
+    '-f', 'mpegts', '-probesize', '131072', '-analyzeduration', '250000', '-i', 'pipe:0',
     '-map', '0:v:0', '-an', '-c:v', 'copy',
     '-muxdelay', '0',
     '-f', 'rtsp', '-rtsp_transport', 'tcp', streamUrl(config, index),
@@ -116,7 +119,7 @@ function publisherArgs(config, index) {
 }
 
 function registerProcess(key, child, failures, encoder, options = {}) {
-  const entry = { child, state: 'starting', verifyTimer: null, index: options.index || 0, kind: options.kind || 'publisher', blocked: false, droppedChunks: 0 };
+  const entry = { child, state: 'starting', verifyTimer: null, index: options.index || 0, kind: options.kind || 'publisher', fanout: options.fanout || null };
   processes.set(key, entry);
   let stderr = '';
   child.stderr.on('data', (chunk) => {
@@ -131,12 +134,14 @@ function registerProcess(key, child, failures, encoder, options = {}) {
   }, entry.kind === 'producer' ? 1000 : 1800);
   child.once('exit', (code, signal) => {
     clearTimeout(entry.verifyTimer);
+    try { entry.fanout?.destroy(); } catch (_) {}
     if (processes.get(key) === entry) processes.delete(key);
     if (code && code !== 0) failures.push({ index: entry.index || 0, code, signal, message: stderr.trim().slice(-1800) });
     sendStatus({ failures, encoder });
   });
   child.once('error', (error) => {
     clearTimeout(entry.verifyTimer);
+    try { entry.fanout?.destroy(); } catch (_) {}
     if (processes.get(key) === entry) processes.delete(key);
     failures.push({ index: entry.index || 0, message: error.message });
     sendStatus({ failures, encoder });
@@ -147,22 +152,25 @@ function registerProcess(key, child, failures, encoder, options = {}) {
 function wireProducerFanout(producer, failures, encoder) {
   producer.stdout.on('data', (chunk) => {
     for (const [key, entry] of processes.entries()) {
-      if (!String(key).startsWith('pub-')) continue;
-      if (entry.child.exitCode !== null || !entry.child.stdin || entry.child.stdin.destroyed) continue;
-      if (entry.blocked) { entry.droppedChunks += 1; continue; }
+      if (!String(key).startsWith('pub-') || !entry.fanout || entry.fanout.destroyed) continue;
       try {
-        const ok = entry.child.stdin.write(chunk);
-        if (!ok) {
-          entry.blocked = true;
-          entry.child.stdin.once('drain', () => { entry.blocked = false; });
-        }
+        // IMPORTANT: write() returning false does NOT mean the chunk failed.
+        // It means Node accepted the data but wants the producer to slow down.
+        // The previous implementation skipped following chunks until 'drain',
+        // corrupting the MPEG-TS stream and causing the apparent 0.5 FPS freezes.
+        // Each publisher now has its own multi-megabyte buffer and receives every
+        // byte in order. A lagging publisher therefore cannot corrupt its stream.
+        entry.fanout.write(chunk);
       } catch (_) {}
     }
   });
-  producer.stdout.once('error', (error) => failures.push({ index: 0, message: `Lokaler Fan-out: ${error.message}` }));
+  producer.stdout.once('error', (error) => {
+    failures.push({ index: 0, message: `Lokaler Fan-out: ${error.message}` });
+    sendStatus({ failures, encoder });
+  });
   producer.once('exit', () => {
     for (const [key, entry] of processes.entries()) {
-      if (String(key).startsWith('pub-')) { try { entry.child.stdin?.end(); } catch (_) {} }
+      if (String(key).startsWith('pub-')) { try { entry.fanout?.end(); } catch (_) {} }
     }
     sendStatus({ failures, encoder });
   });
@@ -178,17 +186,20 @@ async function startStreams(config) {
   if (generation !== startGeneration) return { ok: false, requested: count, encoder, urls: [] };
   sendStatus({ failures, encoder });
 
-  // One producer encodes exactly once to MPEG-TS on stdout. Node duplicates
-  // those bytes locally into one stdin pipe per RTSP publisher. There is no
-  // multicast/Hyper-V network hop and no MediaMTX -> StreamLab round-trip.
+  // One hardware encoder produces a single MPEG-TS stream. Node copies the exact
+  // byte stream into an independent buffered PassThrough for every RTSP publisher.
+  // No packets are dropped on backpressure and one publisher cannot corrupt the
+  // others. Publishers still use -c:v copy, so there is only one encode session.
   for (let index = 1; index <= count; index += 1) {
     if (generation !== startGeneration) break;
     const child = spawn(ffmpegPath(), publisherArgs(config, index), { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
-    registerProcess(`pub-${index}`, child, failures, encoder, { index, kind: 'publisher' });
+    const fanout = new PassThrough({ highWaterMark: 8 * 1024 * 1024 });
+    fanout.pipe(child.stdin);
+    registerProcess(`pub-${index}`, child, failures, encoder, { index, kind: 'publisher', fanout });
     if (index % 8 === 0) await sleep(60);
   }
 
-  await sleep(180);
+  await sleep(250);
   if (generation !== startGeneration) return { ok: false, requested: count, encoder, urls: [] };
   const producerArgs = config.sourceMode === 'file' ? fileProducerArgs(config, encoder) : syntheticProducerArgs(config, encoder);
   const producer = spawn(ffmpegPath(), producerArgs, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -199,7 +210,7 @@ async function startStreams(config) {
     ok: true,
     requested: count,
     encoder,
-    architecture: 'single-encode-local-pipe-fanout',
+    architecture: 'single-encode-buffered-local-fanout',
     urls: Array.from({ length: count }, (_, i) => publicStreamUrl(config, i + 1)),
   };
 }
