@@ -14,222 +14,32 @@ function ffmpegPath() {
   if (!ffmpegStatic) throw new Error('FFmpeg binary was not found.');
   return ffmpegStatic.replace('app.asar', 'app.asar.unpacked');
 }
-
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
-
-function runProbe(args) {
-  return new Promise((resolve) => {
-    const child = spawn(ffmpegPath(), args, { windowsHide: true });
-    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} resolve(false); }, 5000);
-    child.once('error', () => { clearTimeout(timer); resolve(false); });
-    child.once('exit', (code) => { clearTimeout(timer); resolve(code === 0); });
-  });
-}
-
+function runProbe(args) { return new Promise((resolve) => { const child = spawn(ffmpegPath(), args, { windowsHide: true }); const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} resolve(false); }, 5000); child.once('error', () => { clearTimeout(timer); resolve(false); }); child.once('exit', (code) => { clearTimeout(timer); resolve(code === 0); }); }); }
 async function detectEncoder(force = false) {
   if (detectedEncoder && !force) return detectedEncoder;
   const candidates = [
-    { id: 'nvenc', codec: 'h264_nvenc', label: 'NVIDIA NVENC', hardware: true, args: ['-preset', 'p1', '-tune', 'll', '-rc', 'constqp', '-qp', '28'] },
-    { id: 'qsv', codec: 'h264_qsv', label: 'Intel Quick Sync', hardware: true, args: ['-preset', 'veryfast', '-global_quality', '28'] },
-    { id: 'amf', codec: 'h264_amf', label: 'AMD AMF', hardware: true, args: ['-quality', 'speed', '-qp_i', '28', '-qp_p', '28'] },
+    { id: 'nvenc', codec: 'h264_nvenc', label: 'NVIDIA NVENC', hardware: true, args: ['-preset', 'p1', '-tune', 'll'] },
+    { id: 'qsv', codec: 'h264_qsv', label: 'Intel Quick Sync', hardware: true, args: ['-preset', 'veryfast'] },
+    { id: 'amf', codec: 'h264_amf', label: 'AMD AMF', hardware: true, args: ['-quality', 'speed'] },
   ];
-  for (const candidate of candidates) {
-    const ok = await runProbe(['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=size=640x360:rate=25', '-frames:v', '2', '-pix_fmt', 'yuv420p', '-c:v', candidate.codec, ...candidate.args, '-f', 'null', '-']);
-    if (ok) { detectedEncoder = candidate; return candidate; }
-  }
+  for (const candidate of candidates) { const ok = await runProbe(['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=size=640x360:rate=25', '-frames:v', '2', '-pix_fmt', 'yuv420p', '-c:v', candidate.codec, ...candidate.args, '-b:v', '2M', '-maxrate', '2M', '-bufsize', '4M', '-f', 'null', '-']); if (ok) { detectedEncoder = candidate; return candidate; } }
   detectedEncoder = { id: 'cpu', codec: 'libx264', label: 'x264 (CPU)', hardware: false, args: ['-preset', 'ultrafast', '-tune', 'zerolatency'] };
   return detectedEncoder;
 }
-
-function streamUrl(config, index) {
-  const auth = config.username ? `${encodeURIComponent(config.username)}:${encodeURIComponent(config.password || '')}@` : '';
-  const host = String(config.host || '127.0.0.1').trim();
-  const port = Number(config.port || 8554);
-  const suffix = String(index).padStart(2, '0');
-  return `rtsp://${auth}${host}:${port}/streamlab/cam${suffix}`;
-}
-
+function streamUrl(config, index) { const auth = config.username ? `${encodeURIComponent(config.username)}:${encodeURIComponent(config.password || '')}@` : ''; const host = String(config.host || '127.0.0.1').trim(); const port = Number(config.port || 8554); const suffix = String(index).padStart(2, '0'); return `rtsp://${auth}${host}:${port}/streamlab/cam${suffix}`; }
 function publicStreamUrl(config, index) { return streamUrl(config, index).replace(/\/\/.*@/, '//'); }
-
-function stopAll() {
-  startGeneration += 1;
-  for (const entry of processes.values()) {
-    clearTimeout(entry.verifyTimer);
-    try { entry.fanout?.end(); } catch (_) {}
-    try { entry.child.stdin?.end(); } catch (_) {}
-    try { entry.child.kill('SIGTERM'); } catch (_) {}
-  }
-  processes.clear();
-  requestedCount = 0;
-  sendStatus();
-}
-
-function statusSnapshot(extra = {}) {
-  const publishers = [...processes.entries()].filter(([key]) => String(key).startsWith('pub-'));
-  const running = publishers.filter(([, entry]) => entry.state === 'active').length;
-  const starting = publishers.filter(([, entry]) => entry.state === 'starting').length;
-  return {
-    running,
-    starting,
-    streams: publishers.filter(([, entry]) => entry.state === 'active').map(([, entry]) => entry.index).sort((a, b) => a - b),
-    encoder: detectedEncoder,
-    architecture: 'single-encode-buffered-local-fanout',
-    requested: requestedCount,
-    maxBufferedBytes: Math.max(0, ...publishers.map(([, entry]) => Number(entry.fanout?.writableLength || 0))),
-    ...extra,
-  };
-}
-
+function stopAll() { startGeneration += 1; for (const entry of processes.values()) { clearTimeout(entry.verifyTimer); try { entry.fanout?.end(); } catch (_) {} try { entry.child.stdin?.end(); } catch (_) {} try { entry.child.kill('SIGTERM'); } catch (_) {} } processes.clear(); requestedCount = 0; sendStatus(); }
+function statusSnapshot(extra = {}) { const publishers = [...processes.entries()].filter(([key]) => String(key).startsWith('pub-')); const running = publishers.filter(([, entry]) => entry.state === 'active').length; const starting = publishers.filter(([, entry]) => entry.state === 'starting').length; return { running, starting, streams: publishers.filter(([, entry]) => entry.state === 'active').map(([, entry]) => entry.index).sort((a, b) => a - b), encoder: detectedEncoder, architecture: 'single-encode-buffered-local-fanout', requested: requestedCount, maxBufferedBytes: Math.max(0, ...publishers.map(([, entry]) => Number(entry.fanout?.writableLength || 0))), ...extra }; }
 function sendStatus(extra = {}) { mainWindow?.webContents.send('streamlab:status', statusSnapshot(extra)); }
-function encodeArgs(encoder) { return ['-c:v', encoder.codec, ...encoder.args, '-pix_fmt', 'yuv420p']; }
-
-function syntheticProducerArgs(config, encoder) {
-  const width = Number(config.width);
-  const height = Number(config.height);
-  const fps = Number(config.fps);
-  return [
-    '-hide_banner', '-loglevel', 'warning', '-re',
-    '-f', 'lavfi', '-i', `testsrc2=size=${width}x${height}:rate=${fps}`,
-    '-an', ...encodeArgs(encoder),
-    '-g', String(Math.max(fps, 15)), '-keyint_min', String(Math.max(fps, 15)), '-sc_threshold', '0',
-    '-f', 'mpegts', '-muxdelay', '0', '-muxpreload', '0', 'pipe:1',
-  ];
-}
-
-function fileProducerArgs(config, encoder) {
-  const fps = Number(config.fps);
-  return [
-    '-hide_banner', '-loglevel', 'warning', '-re', '-stream_loop', '-1', '-i', config.filePath,
-    '-an', '-vf', `scale=${Number(config.width)}:${Number(config.height)}:force_original_aspect_ratio=decrease,pad=${Number(config.width)}:${Number(config.height)}:(ow-iw)/2:(oh-ih)/2,fps=${fps}`,
-    ...encodeArgs(encoder),
-    '-g', String(Math.max(fps, 15)), '-keyint_min', String(Math.max(fps, 15)), '-sc_threshold', '0',
-    '-f', 'mpegts', '-muxdelay', '0', '-muxpreload', '0', 'pipe:1',
-  ];
-}
-
-function publisherArgs(config, index) {
-  return [
-    '-hide_banner', '-loglevel', 'warning',
-    '-fflags', '+genpts',
-    '-f', 'mpegts', '-probesize', '131072', '-analyzeduration', '250000', '-i', 'pipe:0',
-    '-map', '0:v:0', '-an', '-c:v', 'copy',
-    '-muxdelay', '0',
-    '-f', 'rtsp', '-rtsp_transport', 'tcp', streamUrl(config, index),
-  ];
-}
-
-function registerProcess(key, child, failures, encoder, options = {}) {
-  const entry = { child, state: 'starting', verifyTimer: null, index: options.index || 0, kind: options.kind || 'publisher', fanout: options.fanout || null };
-  processes.set(key, entry);
-  let stderr = '';
-  child.stderr.on('data', (chunk) => {
-    stderr += chunk.toString();
-    if (stderr.length > 10000) stderr = stderr.slice(-10000);
-  });
-  entry.verifyTimer = setTimeout(() => {
-    if (processes.get(key) === entry && entry.child.exitCode === null) {
-      entry.state = 'active';
-      sendStatus({ failures, encoder });
-    }
-  }, entry.kind === 'producer' ? 1000 : 1800);
-  child.once('exit', (code, signal) => {
-    clearTimeout(entry.verifyTimer);
-    try { entry.fanout?.destroy(); } catch (_) {}
-    if (processes.get(key) === entry) processes.delete(key);
-    if (code && code !== 0) failures.push({ index: entry.index || 0, code, signal, message: stderr.trim().slice(-1800) });
-    sendStatus({ failures, encoder });
-  });
-  child.once('error', (error) => {
-    clearTimeout(entry.verifyTimer);
-    try { entry.fanout?.destroy(); } catch (_) {}
-    if (processes.get(key) === entry) processes.delete(key);
-    failures.push({ index: entry.index || 0, message: error.message });
-    sendStatus({ failures, encoder });
-  });
-  return entry;
-}
-
-function wireProducerFanout(producer, failures, encoder) {
-  producer.stdout.on('data', (chunk) => {
-    for (const [key, entry] of processes.entries()) {
-      if (!String(key).startsWith('pub-') || !entry.fanout || entry.fanout.destroyed) continue;
-      try {
-        // IMPORTANT: write() returning false does NOT mean the chunk failed.
-        // It means Node accepted the data but wants the producer to slow down.
-        // The previous implementation skipped following chunks until 'drain',
-        // corrupting the MPEG-TS stream and causing the apparent 0.5 FPS freezes.
-        // Each publisher now has its own multi-megabyte buffer and receives every
-        // byte in order. A lagging publisher therefore cannot corrupt its stream.
-        entry.fanout.write(chunk);
-      } catch (_) {}
-    }
-  });
-  producer.stdout.once('error', (error) => {
-    failures.push({ index: 0, message: `Lokaler Fan-out: ${error.message}` });
-    sendStatus({ failures, encoder });
-  });
-  producer.once('exit', () => {
-    for (const [key, entry] of processes.entries()) {
-      if (String(key).startsWith('pub-')) { try { entry.fanout?.end(); } catch (_) {} }
-    }
-    sendStatus({ failures, encoder });
-  });
-}
-
-async function startStreams(config) {
-  stopAll();
-  const generation = ++startGeneration;
-  const count = Math.max(1, Math.min(64, Number(config.count || 1)));
-  requestedCount = count;
-  const failures = [];
-  const encoder = await detectEncoder();
-  if (generation !== startGeneration) return { ok: false, requested: count, encoder, urls: [] };
-  sendStatus({ failures, encoder });
-
-  // One hardware encoder produces a single MPEG-TS stream. Node copies the exact
-  // byte stream into an independent buffered PassThrough for every RTSP publisher.
-  // No packets are dropped on backpressure and one publisher cannot corrupt the
-  // others. Publishers still use -c:v copy, so there is only one encode session.
-  for (let index = 1; index <= count; index += 1) {
-    if (generation !== startGeneration) break;
-    const child = spawn(ffmpegPath(), publisherArgs(config, index), { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
-    const fanout = new PassThrough({ highWaterMark: 8 * 1024 * 1024 });
-    fanout.pipe(child.stdin);
-    registerProcess(`pub-${index}`, child, failures, encoder, { index, kind: 'publisher', fanout });
-    if (index % 8 === 0) await sleep(60);
-  }
-
-  await sleep(250);
-  if (generation !== startGeneration) return { ok: false, requested: count, encoder, urls: [] };
-  const producerArgs = config.sourceMode === 'file' ? fileProducerArgs(config, encoder) : syntheticProducerArgs(config, encoder);
-  const producer = spawn(ffmpegPath(), producerArgs, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  registerProcess('producer', producer, failures, encoder, { kind: 'producer' });
-  wireProducerFanout(producer, failures, encoder);
-
-  return {
-    ok: true,
-    requested: count,
-    encoder,
-    architecture: 'single-encode-buffered-local-fanout',
-    urls: Array.from({ length: count }, (_, i) => publicStreamUrl(config, i + 1)),
-  };
-}
-
-function createWindow() {
-  mainWindow = new BrowserWindow({ width: 1060, height: 760, minWidth: 850, minHeight: 650, backgroundColor: '#07101d', autoHideMenuBar: true, webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false } });
-  mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
-}
-
-ipcMain.handle('streamlab:choose-file', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, { title: 'Quellvideo auswählen', properties: ['openFile'], filters: [{ name: 'Videos', extensions: ['mp4', 'mkv', 'mov', 'avi', 'webm'] }, { name: 'Alle Dateien', extensions: ['*'] }] });
-  return result.canceled ? '' : result.filePaths[0];
-});
-ipcMain.handle('streamlab:start', (_event, config) => startStreams(config));
-ipcMain.handle('streamlab:stop', () => { stopAll(); return true; });
-ipcMain.handle('streamlab:get-status', async () => { await detectEncoder(); return statusSnapshot(); });
-ipcMain.handle('streamlab:get-encoder', () => detectEncoder());
-
-app.whenReady().then(async () => { createWindow(); await detectEncoder(); sendStatus(); });
-app.on('window-all-closed', () => { stopAll(); if (process.platform !== 'darwin') app.quit(); });
-app.on('before-quit', stopAll);
-app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+function encodeArgs(encoder, config) { const bitrate = Math.max(0.25, Math.min(100, Number(config.bitrateMbps || 4))); const target = `${bitrate}M`; const buffer = `${Math.max(0.5, bitrate * 2)}M`; return ['-c:v', encoder.codec, ...encoder.args, '-pix_fmt', 'yuv420p', '-b:v', target, '-maxrate', target, '-bufsize', buffer]; }
+function syntheticProducerArgs(config, encoder) { const width = Number(config.width); const height = Number(config.height); const fps = Number(config.fps); return ['-hide_banner', '-loglevel', 'warning', '-re', '-f', 'lavfi', '-i', `testsrc2=size=${width}x${height}:rate=${fps}`, '-an', ...encodeArgs(encoder, config), '-g', String(Math.max(fps, 15)), '-keyint_min', String(Math.max(fps, 15)), '-sc_threshold', '0', '-f', 'mpegts', '-muxdelay', '0', '-muxpreload', '0', 'pipe:1']; }
+function fileProducerArgs(config, encoder) { const fps = Number(config.fps); return ['-hide_banner', '-loglevel', 'warning', '-re', '-stream_loop', '-1', '-i', config.filePath, '-an', '-vf', `scale=${Number(config.width)}:${Number(config.height)}:force_original_aspect_ratio=decrease,pad=${Number(config.width)}:${Number(config.height)}:(ow-iw)/2:(oh-ih)/2,fps=${fps}`, ...encodeArgs(encoder, config), '-g', String(Math.max(fps, 15)), '-keyint_min', String(Math.max(fps, 15)), '-sc_threshold', '0', '-f', 'mpegts', '-muxdelay', '0', '-muxpreload', '0', 'pipe:1']; }
+function publisherArgs(config, index) { return ['-hide_banner', '-loglevel', 'warning', '-fflags', '+genpts', '-f', 'mpegts', '-probesize', '131072', '-analyzeduration', '250000', '-i', 'pipe:0', '-map', '0:v:0', '-an', '-c:v', 'copy', '-muxdelay', '0', '-f', 'rtsp', '-rtsp_transport', 'tcp', streamUrl(config, index)]; }
+function registerProcess(key, child, failures, encoder, options = {}) { const entry = { child, state: 'starting', verifyTimer: null, index: options.index || 0, kind: options.kind || 'publisher', fanout: options.fanout || null }; processes.set(key, entry); let stderr = ''; child.stderr.on('data', (chunk) => { stderr += chunk.toString(); if (stderr.length > 10000) stderr = stderr.slice(-10000); }); entry.verifyTimer = setTimeout(() => { if (processes.get(key) === entry && entry.child.exitCode === null) { entry.state = 'active'; sendStatus({ failures, encoder }); } }, entry.kind === 'producer' ? 1000 : 1800); child.once('exit', (code, signal) => { clearTimeout(entry.verifyTimer); try { entry.fanout?.destroy(); } catch (_) {} if (processes.get(key) === entry) processes.delete(key); if (code && code !== 0) failures.push({ index: entry.index || 0, code, signal, message: stderr.trim().slice(-1800) }); sendStatus({ failures, encoder }); }); child.once('error', (error) => { clearTimeout(entry.verifyTimer); try { entry.fanout?.destroy(); } catch (_) {} if (processes.get(key) === entry) processes.delete(key); failures.push({ index: entry.index || 0, message: error.message }); sendStatus({ failures, encoder }); }); return entry; }
+function wireProducerFanout(producer, failures, encoder) { producer.stdout.on('data', (chunk) => { for (const [key, entry] of processes.entries()) { if (!String(key).startsWith('pub-') || !entry.fanout || entry.fanout.destroyed) continue; try { entry.fanout.write(chunk); } catch (_) {} } }); producer.stdout.once('error', (error) => { failures.push({ index: 0, message: `Lokaler Fan-out: ${error.message}` }); sendStatus({ failures, encoder }); }); producer.once('exit', () => { for (const [key, entry] of processes.entries()) { if (String(key).startsWith('pub-')) { try { entry.fanout?.end(); } catch (_) {} } } sendStatus({ failures, encoder }); }); }
+async function startStreams(config) { stopAll(); const generation = ++startGeneration; const count = Math.max(1, Math.min(64, Number(config.count || 1))); requestedCount = count; const failures = []; const encoder = await detectEncoder(); if (generation !== startGeneration) return { ok: false, requested: count, encoder, urls: [] }; sendStatus({ failures, encoder }); for (let index = 1; index <= count; index += 1) { if (generation !== startGeneration) break; const child = spawn(ffmpegPath(), publisherArgs(config, index), { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] }); const fanout = new PassThrough({ highWaterMark: 8 * 1024 * 1024 }); fanout.pipe(child.stdin); registerProcess(`pub-${index}`, child, failures, encoder, { index, kind: 'publisher', fanout }); if (index % 8 === 0) await sleep(60); } await sleep(250); if (generation !== startGeneration) return { ok: false, requested: count, encoder, urls: [] }; const producerArgs = config.sourceMode === 'file' ? fileProducerArgs(config, encoder) : syntheticProducerArgs(config, encoder); const producer = spawn(ffmpegPath(), producerArgs, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }); registerProcess('producer', producer, failures, encoder, { kind: 'producer' }); wireProducerFanout(producer, failures, encoder); return { ok: true, requested: count, encoder, bitrateMbps: Number(config.bitrateMbps || 4), architecture: 'single-encode-buffered-local-fanout', urls: Array.from({ length: count }, (_, i) => publicStreamUrl(config, i + 1)) }; }
+function createWindow() { mainWindow = new BrowserWindow({ width: 1060, height: 760, minWidth: 850, minHeight: 650, backgroundColor: '#07101d', autoHideMenuBar: true, webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false } }); mainWindow.loadFile(path.join(__dirname, 'src', 'index.html')); }
+ipcMain.handle('streamlab:choose-file', async () => { const result = await dialog.showOpenDialog(mainWindow, { title: 'Quellvideo auswählen', properties: ['openFile'], filters: [{ name: 'Videos', extensions: ['mp4', 'mkv', 'mov', 'avi', 'webm'] }, { name: 'Alle Dateien', extensions: ['*'] }] }); return result.canceled ? '' : result.filePaths[0]; });
+ipcMain.handle('streamlab:start', (_event, config) => startStreams(config)); ipcMain.handle('streamlab:stop', () => { stopAll(); return true; }); ipcMain.handle('streamlab:get-status', async () => { await detectEncoder(); return statusSnapshot(); }); ipcMain.handle('streamlab:get-encoder', () => detectEncoder());
+app.whenReady().then(async () => { createWindow(); await detectEncoder(); sendStatus(); }); app.on('window-all-closed', () => { stopAll(); if (process.platform !== 'darwin') app.quit(); }); app.on('before-quit', stopAll); app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
