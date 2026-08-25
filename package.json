@@ -1,0 +1,47 @@
+{
+  "name": "polivision-streamlab",
+  "version": "0.1.0",
+  "description": "Simple RTSP test stream generator for VMS, NVR and recorder testing.",
+  "main": "main.cjs",
+  "author": "PoliVision",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis portable",
+    "dist:portable": "electron-builder --win portable"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
+  },
+  "devDependencies": {
+    "electron": "^37.2.6",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "de.polivision.streamlab",
+    "productName": "PoliVision StreamLab",
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**"
+    ],
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "src/**/*",
+      "node_modules/ffmpeg-static/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false
+    },
+    "artifactName": "PoliVision-StreamLab-${version}-${arch}.${ext}"
+  }
+}
